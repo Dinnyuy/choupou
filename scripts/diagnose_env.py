@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import platform
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -14,6 +15,28 @@ from config import settings
 
 
 def check_module(name: str):
+    native_probe_modules = {
+        "onnxruntime": "import onnxruntime",
+        "torch": "import torch",
+        "ultralytics": "import ultralytics",
+    }
+    if name in native_probe_modules:
+        result = subprocess.run(
+            [sys.executable, "-c", native_probe_modules[name]],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if result.returncode == 0:
+            module = importlib.import_module(name)
+            version = getattr(module, "__version__", "unknown")
+            return True, str(version)
+        if result.returncode < 0:
+            return False, f"import natif instable (signal {-result.returncode})"
+        stderr = (result.stderr or "").strip().splitlines()
+        return False, stderr[-1] if stderr else f"retcode={result.returncode}"
     try:
         module = importlib.import_module(name)
         version = getattr(module, "__version__", "unknown")
@@ -23,21 +46,37 @@ def check_module(name: str):
 
 
 def check_camera() -> str:
-    try:
-        import cv2
-    except Exception as exc:
-        return f"cv2 manquant: {exc}"
-
-    cam = cv2.VideoCapture(settings.camera_index)
-    try:
-        if not cam.isOpened():
-            return f"camera index {settings.camera_index} non ouverte"
+    camera_script = f"""
+import cv2
+cam = cv2.VideoCapture({settings.camera_index})
+try:
+    if not cam.isOpened():
+        print("camera index {settings.camera_index} non ouverte")
+    else:
         ok, _ = cam.read()
-        if not ok:
-            return "camera ouverte mais lecture frame echouee"
-        return "camera OK (opencv)"
-    finally:
-        cam.release()
+        if ok:
+            print("camera OK (opencv)")
+        else:
+            print("camera ouverte mais lecture frame echouee")
+finally:
+    cam.release()
+"""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", camera_script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return f"camera index {settings.camera_index} timeout ouverture/lecture"
+
+    if result.returncode == 0:
+        return (result.stdout or "").strip() or "camera test termine"
+    stderr = (result.stderr or "").strip().splitlines()
+    return stderr[-1] if stderr else f"camera test erreur: {result.returncode}"
 
 
 def check_db() -> str:

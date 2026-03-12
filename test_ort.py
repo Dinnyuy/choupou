@@ -1,10 +1,27 @@
 from __future__ import annotations
 
 import platform
+import subprocess
 import sys
 
 
 def main() -> int:
+    probe = subprocess.run(
+        [sys.executable, "-c", "import onnxruntime as ort; print(ort.__version__)"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if probe.returncode != 0:
+        if probe.returncode < 0:
+            print(f"[ERREUR] onnxruntime provoque un crash natif (signal {-probe.returncode}).")
+        else:
+            details = (probe.stderr or "").strip().splitlines()
+            print(f"[ERREUR] onnxruntime indisponible: {details[-1] if details else probe.returncode}")
+        return 1
+
     try:
         import onnxruntime as ort
     except ImportError as exc:

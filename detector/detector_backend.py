@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -29,10 +31,36 @@ class BaseBackend:
         raise NotImplementedError
 
 
+def _probe_native_module(module_name: str, timeout: int = 15) -> None:
+    """Teste l'import d'un module natif dans un sous-processus.
+
+    Certains paquets natifs ARM peuvent provoquer un crash immediat
+    (ex: Illegal instruction) qui ne peut pas etre capture en Python.
+    """
+    command = [sys.executable, "-c", f"import {module_name}"]
+    result = subprocess.run(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    if result.returncode == 0:
+        return
+
+    stderr = (result.stderr or "").strip().splitlines()
+    details = stderr[-1] if stderr else f"code={result.returncode}"
+    if result.returncode < 0:
+        details = f"signal={-result.returncode}"
+    raise RuntimeError(f"Import natif instable pour {module_name}: {details}")
+
+
 class PTBackend(BaseBackend):
     name = "pt"
 
     def __init__(self, model_path: Path, confidence: float, class_map: Dict[int, str]):
+        _probe_native_module("torch")
         try:
             from ultralytics import YOLO
         except ImportError as exc:
@@ -71,6 +99,7 @@ class ONNXBackend(BaseBackend):
     name = "onnx"
 
     def __init__(self, model_path: Path, confidence: float, class_map: Dict[int, str]):
+        _probe_native_module("onnxruntime")
         try:
             import onnxruntime as ort
         except ImportError as exc:

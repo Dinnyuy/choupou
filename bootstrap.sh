@@ -18,9 +18,22 @@ if [[ "$PY_MAJOR" -lt 3 ]] || [[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -lt 10 ]]; the
   exit 1
 fi
 
+ARCH="$(uname -m)"
+USE_SYSTEM_SITE_PACKAGES=0
+if [[ "$ARCH" == "aarch64" || "$ARCH" == arm* || "$PY_MINOR" -ge 13 ]]; then
+  USE_SYSTEM_SITE_PACKAGES=1
+fi
+
 if [[ ! -d ".venv" ]]; then
   echo "[INFO] Creation du virtualenv .venv"
-  "$PYTHON_BIN" -m venv .venv
+  if [[ "$USE_SYSTEM_SITE_PACKAGES" -eq 1 ]]; then
+    "$PYTHON_BIN" -m venv --system-site-packages .venv
+  else
+    "$PYTHON_BIN" -m venv .venv
+  fi
+elif [[ "$USE_SYSTEM_SITE_PACKAGES" -eq 1 ]]; then
+  echo "[INFO] Mise a niveau du virtualenv .venv avec acces aux paquets systeme"
+  "$PYTHON_BIN" -m venv --upgrade --system-site-packages .venv
 fi
 
 source .venv/bin/activate
@@ -28,7 +41,6 @@ source .venv/bin/activate
 echo "[INFO] Upgrade pip/setuptools/wheel"
 python -m pip install --upgrade pip setuptools wheel
 
-ARCH="$(uname -m)"
 REQ_FILE="requirements/requirements-base.txt"
 if [[ "$ARCH" == "aarch64" || "$ARCH" == arm* ]]; then
   REQ_FILE="requirements/requirements-rpi.txt"

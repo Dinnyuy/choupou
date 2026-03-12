@@ -1,6 +1,8 @@
 Flask>=3.0,<3.2
 Werkzeug>=3.0,<3.2
-numpy>=1.26,<2.1
-opencv-python-headless>=4.9,<5.0
-onnxruntime>=1.17,<1.21; platform_machine == "aarch64" or platform_machine == "x86_64" or platform_machine == "AMD64"
+# Les paquets systeme Debian/Raspberry Pi sont preferes pour les libs natives
+# avec Python 3.13 afin d'eviter des builds sources lents et fragiles.
+numpy>=1.26,<2.3; python_version < "3.13"
+opencv-python-headless>=4.9,<5.0; python_version < "3.13"
+onnxruntime>=1.17,<1.21; (platform_machine == "aarch64" or platform_machine == "x86_64" or platform_machine == "AMD64") and python_version < "3.13"
 python-dotenv>=1.0,<2.0
