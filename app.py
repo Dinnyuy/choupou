@@ -551,7 +551,7 @@ def change_password():
     return jsonify({'success': True, 'message': 'Mot de passe modifié avec succès'})
 
 
-@app.route('/api/profile/upload-picture', methods=['POST'])
+@app.route('/api/profile/upload-picture', methods=['POST'])#jfhjh
 @login_required
 def upload_profile_picture():
     """Uploader une photo de profil"""
