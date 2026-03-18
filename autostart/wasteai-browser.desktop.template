@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=WasteAI Browser
+Comment=Open WasteAI automatically after login
+Exec=/bin/bash __PROJECT_DIR__/scripts/open_browser_on_boot.sh
+Terminal=false
+X-GNOME-Autostart-enabled=true

@@ -1,9 +1,9 @@
 // Detections page functionality
 let currentPage = 1;
 let currentFilters = {
-    startDate: '',
-    endDate: '',
-    wasteType: 'all'
+    start_date: '',
+    end_date: '',
+    waste_type: 'all'
 };
 
 // Load detections on page load
@@ -13,9 +13,9 @@ document.addEventListener('DOMContentLoaded', function () {
 
 // Apply filters
 function applyFilters() {
-    currentFilters.startDate = document.getElementById('startDate').value;
-    currentFilters.endDate = document.getElementById('endDate').value;
-    currentFilters.wasteType = document.getElementById('wasteType').value;
+    currentFilters.start_date = document.getElementById('startDate').value;
+    currentFilters.end_date = document.getElementById('endDate').value;
+    currentFilters.waste_type = document.getElementById('wasteType').value;
     currentPage = 1; // Reset to first page
     loadDetections();
 }
@@ -26,9 +26,9 @@ function resetFilters() {
     document.getElementById('endDate').value = '';
     document.getElementById('wasteType').value = 'all';
     currentFilters = {
-        startDate: '',
-        endDate: '',
-        wasteType: 'all'
+        start_date: '',
+        end_date: '',
+        waste_type: 'all'
     };
     currentPage = 1;
     loadDetections();
@@ -73,7 +73,7 @@ function displayDetections(detections) {
     if (detections.length === 0) {
         tableBody.innerHTML = `
             <tr>
-                <td colspan="4">
+                <td colspan="5">
                     <div class="empty-state">
                         <i class="fas fa-inbox"></i>
                         <h3>Aucune détection trouvée</h3>
@@ -88,6 +88,7 @@ function displayDetections(detections) {
     tableBody.innerHTML = detections.map(detection => `
         <tr>
             <td>${detection.id}</td>
+            <td>${detection.owner || 'Utilisateur inconnu'}</td>
             <td><span class="waste-type-badge">${formatWasteType(detection.waste_type)}</span></td>
             <td>${detection.quantity}</td>
             <td>${formatDate(detection.date)}</td>
@@ -98,11 +99,11 @@ function displayDetections(detections) {
 // Format waste type for display
 function formatWasteType(type) {
     const types = {
-        'plastic': 'Plastique',
-        'paper': 'Papier',
-        'metal': 'Métal',
-        'glass': 'Verre',
-        'organic': 'Organique'
+        'Plastique': 'Plastique',
+        'Papier': 'Papier',
+        'Metal': 'Métal',
+        'Verre': 'Verre',
+        'Carton': 'Carton'
     };
     return types[type] || type;
 }
@@ -194,7 +195,7 @@ function showError(message) {
     const tableBody = document.getElementById('detectionsTableBody');
     tableBody.innerHTML = `
         <tr>
-            <td colspan="4">
+            <td colspan="5">
                 <div class="empty-state">
                     <i class="fas fa-exclamation-triangle" style="color: #dc3545;"></i>
                     <h3>Erreur</h3>

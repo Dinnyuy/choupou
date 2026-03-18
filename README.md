@@ -137,6 +137,43 @@ Lancer Flask:
 
 Puis ouvrir: `http://<ip_machine>:5000`
 
+## Demarrage automatique au boot (Raspberry Pi)
+
+Le depot inclut un service `systemd` et un script d'installation:
+
+```bash
+cd /home/danie/me/choupou
+chmod +x scripts/install_systemd_service.sh
+./scripts/install_systemd_service.sh
+```
+
+Le service utilise `run.sh`, donc il reprend:
+- `.venv`
+- `.env`
+- le preflight
+- le lancement Flask
+
+Commandes utiles:
+
+```bash
+sudo systemctl status wasteai.service
+sudo journalctl -u wasteai.service -f
+sudo systemctl restart wasteai.service
+sudo systemctl disable wasteai.service
+```
+
+### Ouvrir automatiquement le navigateur au login graphique
+
+Si vous voulez que l'interface web s'ouvre toute seule sur le Raspberry Pi apres le demarrage du bureau:
+
+```bash
+cd /home/danie/me/choupou
+chmod +x scripts/open_browser_on_boot.sh scripts/install_browser_autostart.sh
+./scripts/install_browser_autostart.sh
+```
+
+Le script attend que `http://127.0.0.1:5000/login` reponde, puis ouvre Chromium automatiquement.
+
 ## Dependance PDF (reportlab)
 
 L'export PDF reste optionnel.

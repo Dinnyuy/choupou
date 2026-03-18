@@ -3,13 +3,22 @@ from __future__ import annotations
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(PROJECT_ROOT / ".env")
+except Exception:
+    pass
+
 from config import settings
+from detector.camera import CameraSource
 
 
 def probe_import(module_name: str, timeout: int = 10) -> tuple[bool, str]:
@@ -79,6 +88,35 @@ def detector_status() -> tuple[str, list[str]]:
     return "degraded", details
 
 
+def camera_status(retries: int = 3, delay_seconds: float = 0.75) -> tuple[bool, str]:
+    last_message = (
+        f"Camera indisponible (mode={settings.camera_mode}, index={settings.camera_index})"
+    )
+
+    for attempt in range(max(1, retries)):
+        source = CameraSource(mode=settings.camera_mode, camera_index=settings.camera_index)
+        try:
+            if source.open():
+                mode = source.active_mode or settings.camera_mode
+                if mode == "opencv":
+                    active_index = source.active_camera_index
+                    suffix = f", index={active_index}" if active_index is not None else ""
+                    return True, f"Camera OK: backend {mode}{suffix}"
+                return True, f"Camera OK: backend {mode}"
+        except Exception as exc:
+            last_message = f"Camera erreur: {exc}"
+        finally:
+            try:
+                source.release()
+            except Exception:
+                pass
+
+        if attempt < retries - 1:
+            time.sleep(max(0.0, delay_seconds))
+
+    return False, last_message
+
+
 def main() -> int:
     print("[PRECHECK] Python:", sys.version.split()[0])
     print("[PRECHECK] Base dir:", settings.base_dir)
@@ -89,6 +127,9 @@ def main() -> int:
     env_file = settings.base_dir / ".env"
     print(f"[PRECHECK] .env: {'present' if env_file.exists() else 'absent'}")
 
+    camera_ok, camera_msg = camera_status()
+    print(f"[PRECHECK] {camera_msg}")
+
     detector_state, detector_details = detector_status()
     if detector_state == "ready":
         print(f"[PRECHECK] Detecteur: {detector_details[0]}")
@@ -98,7 +139,7 @@ def main() -> int:
             print(f"  - {item}")
         print("[PRECHECK] L'application web demarrera, mais la detection restera indisponible.")
 
-    if not db_ok:
+    if not db_ok or not camera_ok:
         return 1
     return 0
 

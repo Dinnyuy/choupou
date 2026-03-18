@@ -1,0 +1,32 @@
+{
+  "format": "BGR888",
+  "manual": {
+    "colour_gains": [
+      1.4757,
+      1.6304
+    ],
+    "exposure_time": 66663,
+    "analogue_gain": 9.8462
+  },
+  "shape": [
+    480,
+    640,
+    3
+  ],
+  "dtype": "uint8",
+  "metadata": {
+    "ColourGains": [
+      1.4757000207901,
+      1.6303999423980713
+    ],
+    "ExposureTime": 66653,
+    "AnalogueGain": 9.84615421295166,
+    "AwbEnable": null,
+    "AeEnable": null
+  },
+  "channel_means_bgr": [
+    249.483115234375,
+    246.23029296875,
+    184.65833333333333
+  ]
+}

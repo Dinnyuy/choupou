@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -7,6 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from config import settings
 
 try:
     import cv2
@@ -107,24 +109,77 @@ class ONNXBackend(BaseBackend):
                 "Backend ONNX demande onnxruntime. Installez les dependances RPi/base."
             ) from exc
 
-        self._session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        session_options = ort.SessionOptions()
+        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        session_options.inter_op_num_threads = 1
+        session_options.intra_op_num_threads = settings.onnx_threads
+
+        self._session = ort.InferenceSession(
+            str(model_path),
+            sess_options=session_options,
+            providers=["CPUExecutionProvider"],
+        )
         self._input_name = self._session.get_inputs()[0].name
         input_shape = self._session.get_inputs()[0].shape
         # shape attendu: [1,3,H,W] ou [None,3,H,W]
         self._input_h = int(input_shape[2]) if input_shape[2] not in (None, "None") else 640
         self._input_w = int(input_shape[3]) if input_shape[3] not in (None, "None") else 640
         self._confidence = confidence
-        self._class_map = class_map
+        self._class_map = self._read_class_map(class_map)
 
-    def _prepare(self, frame: np.ndarray) -> np.ndarray:
+    def _read_class_map(self, fallback_map: Dict[int, str]) -> Dict[int, str]:
+        metadata = self._session.get_modelmeta().custom_metadata_map or {}
+        names_raw = metadata.get("names")
+        if not names_raw:
+            return fallback_map
+        try:
+            parsed = ast.literal_eval(names_raw)
+        except (ValueError, SyntaxError):
+            return fallback_map
+
+        if isinstance(parsed, dict):
+            items = parsed.items()
+        elif isinstance(parsed, list):
+            items = enumerate(parsed)
+        else:
+            return fallback_map
+
+        resolved: Dict[int, str] = {}
+        for key, value in items:
+            try:
+                class_id = int(key)
+            except (TypeError, ValueError):
+                continue
+            resolved[class_id] = str(value).strip().capitalize()
+        return resolved or fallback_map
+
+    def _prepare(self, frame: np.ndarray) -> Tuple[np.ndarray, Tuple[float, float, float]]:
+        height, width = frame.shape[:2]
+        scale = min(self._input_w / width, self._input_h / height)
+        resized_w = max(1, int(round(width * scale)))
+        resized_h = max(1, int(round(height * scale)))
+
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        resized = cv2.resize(rgb, (self._input_w, self._input_h))
-        tensor = resized.astype(np.float32) / 255.0
-        tensor = np.transpose(tensor, (2, 0, 1))[None, ...]
-        return tensor
+        resized = cv2.resize(rgb, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
 
-    def _decode(self, raw_output: np.ndarray, frame_shape: Tuple[int, int, int]) -> List[Detection]:
+        padded = np.full((self._input_h, self._input_w, 3), 114, dtype=np.uint8)
+        pad_x = (self._input_w - resized_w) // 2
+        pad_y = (self._input_h - resized_h) // 2
+        padded[pad_y : pad_y + resized_h, pad_x : pad_x + resized_w] = resized
+
+        tensor = padded.astype(np.float32) / 255.0
+        tensor = np.transpose(tensor, (2, 0, 1))[None, ...]
+        return tensor, (scale, float(pad_x), float(pad_y))
+
+    def _decode(
+        self,
+        raw_output: np.ndarray,
+        frame_shape: Tuple[int, int, int],
+        prep_info: Tuple[float, float, float],
+    ) -> List[Detection]:
         height, width = frame_shape[:2]
+        scale, pad_x, pad_y = prep_info
         output = np.squeeze(raw_output)
         if output.ndim != 2:
             return []
@@ -151,10 +206,10 @@ class ONNXBackend(BaseBackend):
         converted_boxes: List[List[int]] = []
         for box in boxes:
             cx, cy, bw, bh = box.tolist()
-            x1 = int((cx - bw / 2) * width / self._input_w)
-            y1 = int((cy - bh / 2) * height / self._input_h)
-            x2 = int((cx + bw / 2) * width / self._input_w)
-            y2 = int((cy + bh / 2) * height / self._input_h)
+            x1 = int(max(0, min(width - 1, (cx - bw / 2 - pad_x) / scale)))
+            y1 = int(max(0, min(height - 1, (cy - bh / 2 - pad_y) / scale)))
+            x2 = int(max(0, min(width - 1, (cx + bw / 2 - pad_x) / scale)))
+            y2 = int(max(0, min(height - 1, (cy + bh / 2 - pad_y) / scale)))
             converted_boxes.append([x1, y1, max(1, x2 - x1), max(1, y2 - y1)])
 
         indices = cv2.dnn.NMSBoxes(
@@ -183,11 +238,11 @@ class ONNXBackend(BaseBackend):
         return detections
 
     def detect(self, frame: np.ndarray) -> List[Detection]:
-        tensor = self._prepare(frame)
+        tensor, prep_info = self._prepare(frame)
         outputs = self._session.run(None, {self._input_name: tensor})
         if not outputs:
             return []
-        return self._decode(outputs[0], frame.shape)
+        return self._decode(outputs[0], frame.shape, prep_info)
 
 
 def choose_backend(

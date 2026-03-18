@@ -74,8 +74,8 @@ async function loadStatistics() {
         displayStats('lastMonthTotal', 'lastMonthWaste', lastMonth);
         displayStats('totalSince', 'totalWaste', total);
 
-        // Initial pie chart load with current data
-        updatePieChart(currentDistribution);
+        // Initial pie chart load using the currently selected month/year filters
+        await updatePieChart();
         console.log('Statistics loaded successfully');
     } catch (error) {
         console.error('Erreur lors du chargement des statistiques:', error);
@@ -92,6 +92,7 @@ function displayStats(totalId, wasteId, data) {
     const colors = {
         'Papier': '#2196F3',
         'Plastique': '#9C27B0',
+        'Metal': '#FF9800',
         'Métal': '#FF9800',
         'Verre': '#00BCD4',
         'Carton': '#FF5722'
@@ -156,6 +157,7 @@ async function updatePieChart(existingData = null) {
     const colors = {
         'Papier': '#2196F3',
         'Plastique': '#9C27B0',
+        'Metal': '#FF9800',
         'Métal': '#FF9800',
         'Verre': '#00BCD4',
         'Carton': '#FF5722',

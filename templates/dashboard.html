@@ -162,22 +162,14 @@
                             <h3>Répartition mensuelle des déchets</h3>
                             <div class="chart-filters">
                                 <select id="pieYearFilter" onchange="updatePieChart()">
-                                    <option value="2025">2025</option>
-                                    <option value="2026" selected>2026</option>
+                                    {% for year in chart_years %}
+                                    <option value="{{ year }}" {% if year == current_year %}selected{% endif %}>{{ year }}</option>
+                                    {% endfor %}
                                 </select>
                                 <select id="pieMonthFilter" onchange="updatePieChart()">
-                                    <option value="01">Janvier</option>
-                                    <option value="02" selected>Février</option>
-                                    <option value="03">Mars</option>
-                                    <option value="04">Avril</option>
-                                    <option value="05">Mai</option>
-                                    <option value="06">Juin</option>
-                                    <option value="07">Juillet</option>
-                                    <option value="08">Août</option>
-                                    <option value="09">Septembre</option>
-                                    <option value="10">Octobre</option>
-                                    <option value="11">Novembre</option>
-                                    <option value="12">Décembre</option>
+                                    {% for month_value, month_label in month_options %}
+                                    <option value="{{ month_value }}" {% if month_value == current_month %}selected{% endif %}>{{ month_label }}</option>
+                                    {% endfor %}
                                 </select>
                             </div>
                         </div>
@@ -197,16 +189,15 @@
                             <h3>Performance de <span id="selectedMonthWaste">tri mensuel</span></h3>
                             <div class="chart-filters">
                                 <select id="yearFilter" onchange="updateMonthlyChart()">
-                                    <option value="2023">2023</option>
-                                    <option value="2024">2024</option>
-                                    <option value="2025">2025</option>
-                                    <option value="2026" selected>2026</option>
+                                    {% for year in chart_years %}
+                                    <option value="{{ year }}" {% if year == current_year %}selected{% endif %}>{{ year }}</option>
+                                    {% endfor %}
                                 </select>
                                 <select id="monthWasteFilter" onchange="updateMonthlyChart()">
                                     <option value="all">Tous les déchets</option>
                                     <option value="Papier">Papier</option>
                                     <option value="Plastique">Plastique</option>
-                                    <option value="Métal">Métal</option>
+                                    <option value="Metal">Métal</option>
                                     <option value="Verre">Verre</option>
                                     <option value="Carton">Carton</option>
                                 </select>
@@ -229,7 +220,7 @@
                                     <option value="all">Tous les déchets</option>
                                     <option value="Papier">Papier</option>
                                     <option value="Plastique">Plastique</option>
-                                    <option value="Métal">Métal</option>
+                                    <option value="Metal">Métal</option>
                                     <option value="Verre">Verre</option>
                                     <option value="Carton">Carton</option>
                                 </select>

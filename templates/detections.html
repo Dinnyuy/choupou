@@ -71,7 +71,7 @@
             </header>
 
             <div class="content">
-                <p class="subtitle">Consultez et exportez l'historique de toutes vos détections de déchets.</p>
+                <p class="subtitle">Consultez et exportez l'historique global des détections de déchets de toute l'application.</p>
 
                 <section class="content-sheet">
                     <!-- Filters Section -->
@@ -90,11 +90,11 @@
                                 <label for="wasteType">Type de déchet</label>
                                 <select id="wasteType" class="filter-input">
                                     <option value="all">Tous</option>
-                                    <option value="plastic">Plastique</option>
-                                    <option value="paper">Papier</option>
-                                    <option value="metal">Métal</option>
-                                    <option value="glass">Verre</option>
-                                    <option value="organic">Organique</option>
+                                    <option value="Plastique">Plastique</option>
+                                    <option value="Papier">Papier</option>
+                                    <option value="Metal">Métal</option>
+                                    <option value="Verre">Verre</option>
+                                    <option value="Carton">Carton</option>
                                 </select>
                             </div>
                             <div class="filter-actions">
@@ -132,6 +132,7 @@
                                 <thead>
                                     <tr>
                                         <th>ID</th>
+                                        <th>Profil source</th>
                                         <th>Type de déchet</th>
                                         <th>Quantité</th>
                                         <th>Date de détection</th>

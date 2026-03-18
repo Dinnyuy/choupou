@@ -1,0 +1,21 @@
+[Unit]
+Description=WasteAI Detection Web App
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__RUN_AS_USER__
+Group=__RUN_AS_GROUP__
+WorkingDirectory=__PROJECT_DIR__
+Environment=HOME=__USER_HOME__
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/bash __PROJECT_DIR__/run.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

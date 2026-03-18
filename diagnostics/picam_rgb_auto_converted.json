@@ -1,0 +1,25 @@
+{
+  "format": "RGB888",
+  "manual": null,
+  "shape": [
+    480,
+    640,
+    3
+  ],
+  "dtype": "uint8",
+  "metadata": {
+    "ColourGains": [
+      1.195764422416687,
+      2.6496105194091797
+    ],
+    "ExposureTime": 29999,
+    "AnalogueGain": 3.2820513248443604,
+    "AwbEnable": null,
+    "AeEnable": null
+  },
+  "channel_means_bgr": [
+    124.681640625,
+    135.37708333333333,
+    131.48423177083333
+  ]
+}

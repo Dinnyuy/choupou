@@ -57,6 +57,79 @@ class WasteDetector:
     def is_ready(self) -> bool:
         return self._backend is not None
 
+    def detect_objects(self, frame: np.ndarray) -> List[dict]:
+        if not self._backend or frame is None:
+            return []
+
+        try:
+            detections = self._backend.detect(frame)
+        except Exception:
+            return []
+
+        formatted = []
+        frame_height, frame_width = frame.shape[:2]
+        frame_area = max(1, frame_width * frame_height)
+        edge_margin = max(2, int(round(min(frame_width, frame_height) * 0.02)))
+        for det in detections:
+            x1, y1, x2, y2 = [int(value) for value in det.box_xyxy]
+            x1 = max(0, min(frame_width - 1, x1))
+            y1 = max(0, min(frame_height - 1, y1))
+            x2 = max(x1 + 1, min(frame_width, x2))
+            y2 = max(y1 + 1, min(frame_height, y2))
+
+            box_area = max(1, (x2 - x1) * (y2 - y1))
+            area_ratio = box_area / frame_area
+            if area_ratio < settings.detection_min_box_area_ratio:
+                continue
+            if area_ratio > settings.detection_max_box_area_ratio:
+                continue
+
+            edge_touches = sum(
+                (
+                    x1 <= edge_margin,
+                    y1 <= edge_margin,
+                    x2 >= frame_width - edge_margin,
+                    y2 >= frame_height - edge_margin,
+                )
+            )
+            if (
+                area_ratio >= settings.detection_large_edge_box_area_ratio
+                and edge_touches >= settings.detection_large_edge_box_min_touches
+            ):
+                continue
+
+            formatted.append(
+                {
+                    "waste_type": det.label,
+                    "confidence": det.confidence,
+                    "box": np.array((x1, y1, x2, y2), dtype=np.int32),
+                }
+            )
+        formatted.sort(key=lambda item: float(item["confidence"]), reverse=True)
+        return formatted
+
+    def summarize_detections(self, detections: List[dict]) -> Dict[str, int]:
+        summary: Dict[str, int] = {}
+        for det in detections:
+            waste_type = det["waste_type"]
+            summary[waste_type] = summary.get(waste_type, 0) + 1
+        return summary
+
+    def draw_detections(self, frame: np.ndarray, detections: List[dict]) -> np.ndarray:
+        for det in detections:
+            x1, y1, x2, y2 = map(int, det["box"].tolist())
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 230, 0), 2)
+            cv2.putText(
+                frame,
+                f"{det['waste_type']} {det['confidence']:.2f}",
+                (x1, max(12, y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 230, 0),
+                2,
+            )
+        return frame
+
     def detect_from_image(self, image_path: str):
         if not self._backend:
             return None, self._last_error or "Aucun backend disponible"
@@ -70,44 +143,17 @@ class WasteDetector:
             return None, f"Impossible de lire l'image: {image_file}"
 
         try:
-            detections = self._backend.detect(image)
+            formatted = self.detect_objects(image)
         except Exception as exc:
             return None, f"Erreur inference ({self.backend_name}): {exc}"
-
-        formatted = []
-        for det in detections:
-            formatted.append(
-                {
-                    "waste_type": det.label,
-                    "confidence": det.confidence,
-                    "box": np.array(det.box_xyxy, dtype=np.int32),
-                }
-            )
         return formatted, {"backend": self.backend_name}
 
     def detect_from_frame(self, frame: np.ndarray):
         if not self._backend:
             return frame, {}
-
-        try:
-            detections = self._backend.detect(frame)
-        except Exception:
-            return frame, {}
-
-        summary: Dict[str, int] = {}
-        for det in detections:
-            summary[det.label] = summary.get(det.label, 0) + 1
-            x1, y1, x2, y2 = det.box_xyxy
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 230, 0), 2)
-            cv2.putText(
-                frame,
-                f"{det.label} {det.confidence:.2f}",
-                (x1, max(12, y1 - 10)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 230, 0),
-                2,
-            )
+        detections = self.detect_objects(frame)
+        summary = self.summarize_detections(detections)
+        frame = self.draw_detections(frame, detections)
         return frame, summary
 
     def detect_from_webcam(self, user_id: int, duration: int = 10):
@@ -125,7 +171,9 @@ class WasteDetector:
                 ok, frame = camera.read()
                 if not ok or frame is None:
                     continue
-                _, frame_summary = self.detect_from_frame(frame)
+                detection_frame = camera.prepare_for_detection(frame.copy())
+                detections = self.detect_objects(detection_frame)
+                frame_summary = self.summarize_detections(detections)
                 for key, value in frame_summary.items():
                     summary[key] = summary.get(key, 0) + value
         finally:

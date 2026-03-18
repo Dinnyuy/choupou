@@ -1,0 +1,25 @@
+{
+  "format": "BGR888",
+  "manual": null,
+  "shape": [
+    480,
+    640,
+    3
+  ],
+  "dtype": "uint8",
+  "metadata": {
+    "ColourGains": [
+      1.1948065757751465,
+      2.649103879928589
+    ],
+    "ExposureTime": 29999,
+    "AnalogueGain": 3.3246753215789795,
+    "AwbEnable": null,
+    "AeEnable": null
+  },
+  "channel_means_bgr": [
+    124.17948567708333,
+    134.61698893229166,
+    131.408466796875
+  ]
+}

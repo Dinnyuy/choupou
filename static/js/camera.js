@@ -143,8 +143,12 @@ function updateDetectionsDisplay(detections) {
     const wasteColors = {
         'Papier': '#2196F3',
         'Plastique': '#9C27B0',
+        'plastique': '#9C27B0',
+        'metal': '#FF9800',
         'Métal': '#FF9800',
+        'Metal': '#FF9800',
         'Verre': '#00BCD4',
+        'verre': '#00BCD4',
         'Carton': '#FF5722'
     };
 

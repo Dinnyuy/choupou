@@ -1,10 +1,14 @@
 from flask import Flask, render_template, request, jsonify, session, redirect, Response, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import io
 import os
 import sqlite3
 import tempfile
+import atexit
+from threading import Lock
+import unicodedata
 import uuid
 from datetime import datetime, timedelta
 from functools import wraps
@@ -19,7 +23,11 @@ except Exception:
 
 from config import settings
 from detector.camera import CameraSource
+from detector.stream_tracker import StreamDetectionTracker
 from yolo_detector import WasteDetector
+
+# ---------- NEW: Robotic arm import ----------
+from arm_controller import RoboticArm
 
 app = Flask(
     __name__,
@@ -30,6 +38,22 @@ app.secret_key = settings.secret_key
 
 # Chemin de la base de donnees
 DB_PATH = str(settings.db_path)
+
+robotic_arm = RoboticArm(
+    port=settings.arm_port,
+    baudrate=settings.arm_baud,
+    mock=settings.arm_mock,
+    ack_timeout=settings.arm_ack_timeout,
+    queue_maxsize=settings.arm_queue_maxsize,
+)
+
+
+@atexit.register
+def shutdown_robotic_arm():
+    try:
+        robotic_arm.shutdown()
+    except Exception:
+        pass
 
 # Initialiser le detecteur
 try:
@@ -44,9 +68,129 @@ except Exception as e:
 
 # Variable globale pour la camera
 camera = None
+camera_stream_lock = Lock()
+active_stream_clients = 0
 detection_buffer = {}  # Buffer pour accumuler les détections
 frame_count = 0  # Compteur de frames
 SAVE_INTERVAL = 10  # Sauvegarder toutes les 10 frames
+STREAM_DETECT_EVERY_N_FRAMES = settings.stream_detect_every_n_frames
+JPEG_ENCODE_PARAMS = [int(cv2.IMWRITE_JPEG_QUALITY), settings.stream_jpeg_quality]
+stream_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wasteai-stream")
+stream_detection_future = None
+stream_latest_detections = []
+stream_frames_seen = 0
+stream_tracker = StreamDetectionTracker(
+    required_hits=settings.stream_confirm_hits,
+    max_misses=settings.stream_track_max_misses,
+    iou_threshold=settings.stream_track_iou_threshold,
+    fast_confirm_confidence=settings.stream_fast_confirm_confidence,
+)
+# ---------- NEW: Store newly confirmed detections ----------
+stream_new_counts = {}
+
+MONTH_OPTIONS = [
+    ("01", "Janvier"),
+    ("02", "Fevrier"),
+    ("03", "Mars"),
+    ("04", "Avril"),
+    ("05", "Mai"),
+    ("06", "Juin"),
+    ("07", "Juillet"),
+    ("08", "Aout"),
+    ("09", "Septembre"),
+    ("10", "Octobre"),
+    ("11", "Novembre"),
+    ("12", "Decembre"),
+]
+WASTE_TYPE_ALIASES = {
+    "papier": "Papier",
+    "plastique": "Plastique",
+    "metal": "Metal",
+    "verre": "Verre",
+    "carton": "Carton",
+}
+
+
+def normalize_waste_type_label(value: str | None) -> str | None:
+    if value is None:
+        return None
+    label = str(value).strip()
+    if not label:
+        return None
+    normalized_key = (
+        unicodedata.normalize("NFKD", label)
+        .encode("ascii", "ignore")
+        .decode("ascii")
+        .lower()
+    )
+    return WASTE_TYPE_ALIASES.get(normalized_key, label)
+
+
+def aggregate_waste_rows(rows) -> dict[str, int]:
+    totals: dict[str, int] = {}
+    for waste_type, quantity in rows:
+        if quantity in (None, 0):
+            continue
+        canonical = normalize_waste_type_label(waste_type)
+        if canonical is None:
+            continue
+        totals[canonical] = totals.get(canonical, 0) + int(quantity)
+
+    ordered: dict[str, int] = {}
+    for label in dict.fromkeys(settings.waste_classes.values()):
+        if label in totals:
+            ordered[label] = totals[label]
+    for label in sorted(key for key in totals if key not in ordered):
+        ordered[label] = totals[label]
+    return ordered
+
+
+def parse_year_month(year_raw, month_raw) -> tuple[str, str]:
+    now = datetime.now()
+    try:
+        parsed = datetime(int(year_raw), int(month_raw), 1)
+    except (TypeError, ValueError):
+        parsed = datetime(now.year, now.month, 1)
+    return parsed.strftime("%Y"), parsed.strftime("%m")
+
+
+def normalize_detection_types_in_db(cursor) -> None:
+    replacements = {
+        "papier": "Papier",
+        "plastique": "Plastique",
+        "metal": "Metal",
+        "Métal": "Metal",
+        "métal": "Metal",
+        "verre": "Verre",
+        "carton": "Carton",
+    }
+    for source, target in replacements.items():
+        cursor.execute(
+            "UPDATE waste_detection SET waste_type = ? WHERE waste_type = ?",
+            (target, source),
+        )
+
+
+def build_global_detection_filters(start_date, end_date, waste_type):
+    normalized_waste_type = normalize_waste_type_label(waste_type or 'all')
+    clauses = []
+    params = []
+
+    if start_date:
+        clauses.append('DATE(wd.detection_date) >= ?')
+        params.append(start_date)
+
+    if end_date:
+        clauses.append('DATE(wd.detection_date) <= ?')
+        params.append(end_date)
+
+    if normalized_waste_type and normalized_waste_type != 'all':
+        clauses.append('wd.waste_type = ?')
+        params.append(normalized_waste_type)
+
+    where_sql = f" WHERE {' AND '.join(clauses)}" if clauses else ''
+    return where_sql, params
+
 
 def load_yolo():
     global YOLO_DETECTOR
@@ -54,6 +198,7 @@ def load_yolo():
         return True
     YOLO_DETECTOR = WasteDetector(backend=settings.backend, db_path=DB_PATH)
     return YOLO_DETECTOR.is_ready()
+
 
 def get_camera() -> CameraSource:
     global camera
@@ -67,11 +212,54 @@ def get_camera() -> CameraSource:
         camera = source
     return camera
 
+
+def reset_stream_state():
+    global detection_buffer, frame_count, stream_detection_future, stream_latest_detections, stream_frames_seen, stream_new_counts
+    detection_buffer = {}
+    frame_count = 0
+    stream_latest_detections = []
+    stream_frames_seen = 0
+    stream_new_counts = {}
+    stream_tracker.reset()
+    if stream_detection_future is not None:
+        stream_detection_future.cancel()
+        stream_detection_future = None
+
+
+def _collect_async_detections():
+    global stream_detection_future, stream_latest_detections, stream_new_counts, detection_buffer
+    if stream_detection_future is None or not stream_detection_future.done():
+        return
+    try:
+        raw_detections = stream_detection_future.result()
+        stream_latest_detections, new_counts = stream_tracker.update(raw_detections)
+        stream_new_counts = new_counts
+        for waste_type, count in new_counts.items():
+            detection_buffer[waste_type] = detection_buffer.get(waste_type, 0) + count
+    except Exception as exc:
+        print(f"Erreur detection async: {exc}")
+    finally:
+        stream_detection_future = None
+
+
 def release_camera():
     global camera
     if camera is not None:
         camera.release()
         camera = None
+
+
+def flush_detection_buffer(user_id=None):
+    global detection_buffer, frame_count
+    if user_id and detection_buffer and YOLO_DETECTOR and YOLO_DETECTOR.is_ready():
+        try:
+            YOLO_DETECTOR.save_detections_to_db(user_id, detection_buffer)
+            print(f"Detections sauvegardees: {detection_buffer}")
+        except Exception as e:
+            print(f"Erreur sauvegarde detections: {e}")
+    detection_buffer = {}
+    frame_count = 0
+
 
 # Initialiser la base de données
 def init_db():
@@ -117,6 +305,11 @@ def init_db():
                   quantity INTEGER,
                   detection_date TIMESTAMP,
                   FOREIGN KEY(user_id) REFERENCES users(id))''')
+    normalize_detection_types_in_db(c)
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_waste_detection_user_date "
+        "ON waste_detection (user_id, detection_date)"
+    )
     
     # Table des robots
     c.execute('''CREATE TABLE IF NOT EXISTS robots
@@ -141,6 +334,7 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 init_db()
 
 # Décorateur pour vérifier l'authentification
@@ -151,6 +345,7 @@ def login_required(f):
             return redirect('/login')
         return f(*args, **kwargs)
     return decorated_function
+
 
 # Décorateur pour vérifier les droits admin
 def admin_required(f):
@@ -163,17 +358,20 @@ def admin_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+
 # ==================== ROUTES D'AUTHENTIFICATION ====================
 
 @app.route('/')
 def index():
     return redirect('/login')
 
+
 @app.route('/login')
 def login_page():
     if 'user_id' in session:
         return redirect('/dashboard')
     return render_template('login.html')
+
 
 @app.route('/api/login', methods=['POST'])
 def login():
@@ -203,6 +401,7 @@ def login():
     
     conn.close()
     return jsonify({'success': False, 'message': 'Email ou mot de passe incorrect'}), 401
+
 
 @app.route('/api/register', methods=['POST'])
 def register():
@@ -234,10 +433,12 @@ def register():
     except sqlite3.IntegrityError:
         return jsonify({'success': False, 'message': 'Cet email est déjà utilisé'}), 400
 
+
 @app.route('/api/logout', methods=['POST'])
 def logout():
     session.clear()
     return jsonify({'success': True, 'message': 'Déconnexion réussie'})
+
 
 # ==================== ROUTES PROFIL ====================
 
@@ -246,8 +447,10 @@ UPLOAD_FOLDER = str(settings.upload_dir)
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
 
 @app.route('/profile')
 @login_required
@@ -255,11 +458,13 @@ def profile_page():
     """Page de profil utilisateur"""
     return render_template('profile.html', email=session.get('email'))
 
+
 @app.route('/logout')
 def logout_user():
     """Déconnexion de l'utilisateur"""
     session.clear()
     return redirect('/login')
+
 
 @app.route('/api/profile', methods=['GET'])
 @login_required
@@ -285,6 +490,7 @@ def get_profile():
     
     return jsonify({'success': False, 'message': 'Utilisateur non trouvé'}), 404
 
+
 @app.route('/api/profile/update', methods=['POST'])
 @login_required
 def update_profile():
@@ -306,6 +512,7 @@ def update_profile():
         return jsonify({'success': True, 'message': 'Profil mis à jour'})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
+
 
 @app.route('/api/profile/change-password', methods=['POST'])
 @login_required
@@ -342,6 +549,7 @@ def change_password():
     conn.close()
     
     return jsonify({'success': True, 'message': 'Mot de passe modifié avec succès'})
+
 
 @app.route('/api/profile/upload-picture', methods=['POST'])
 @login_required
@@ -403,6 +611,7 @@ def upload_profile_picture():
     
     return jsonify({'success': False, 'message': 'Type de fichier non autorisé (png, jpg, jpeg, gif)'}), 400
 
+
 @app.route('/api/user/info', methods=['GET'])
 @login_required
 def get_user_info():
@@ -425,12 +634,23 @@ def get_user_info():
     
     return jsonify({'success': False}), 404
 
+
 # ==================== ROUTES DASHBOARD ====================
 
 @app.route('/dashboard')
 @login_required
 def dashboard():
-    return render_template('dashboard.html', email=session.get('email'))
+    current_now = datetime.now()
+    chart_years = list(range(max(2023, current_now.year - 3), current_now.year + 1))
+    return render_template(
+        'dashboard.html',
+        email=session.get('email'),
+        current_year=current_now.year,
+        current_month=current_now.strftime('%m'),
+        chart_years=chart_years,
+        month_options=MONTH_OPTIONS,
+    )
+
 
 @app.route('/api/waste/add', methods=['POST'])
 @login_required
@@ -438,7 +658,7 @@ def add_waste_detection():
     user_id = session.get('user_id')
     data = request.json
     
-    waste_type = data.get('waste_type')
+    waste_type = normalize_waste_type_label(data.get('waste_type'))
     quantity = data.get('quantity', 1)
     detection_date = data.get('detection_date', datetime.now())
     
@@ -455,6 +675,7 @@ def add_waste_detection():
     
     return jsonify({'success': True, 'message': 'Déchet ajouté'})
 
+
 # ==================== ROUTES CAMERA ====================
 
 @app.route('/camera')
@@ -462,9 +683,10 @@ def add_waste_detection():
 def camera_page():
     return render_template('camera.html', email=session.get('email'))
 
+
 def gen_frames(user_id=None):
-    global frame_count, detection_buffer
-    
+    global frame_count, detection_buffer, stream_detection_future, stream_frames_seen, active_stream_clients, stream_new_counts
+
     try:
         cam = get_camera()
     except RuntimeError as exc:
@@ -478,62 +700,74 @@ def gen_frames(user_id=None):
                    b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
         return
 
+    with camera_stream_lock:
+        active_stream_clients += 1
+
     if not cam.is_opened():
         print("Camera non accessible (is_opened=False)")
     else:
         print("Flux camera demarre")
 
-    while True:
-        success, frame = cam.read()
-        if not success:
-            print("Echec lecture frame camera")
-            # Générer une image d'erreur
-            error_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-            cv2.putText(error_frame, "ERREUR CAMERA", (50, 240), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            ret, buffer = cv2.imencode('.jpg', error_frame)
-            frame = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-            break
-        else:
-            # Detection YOLO si disponible
-            detections_summary = {}
-            if YOLO_DETECTOR and YOLO_DETECTOR.is_ready():
-                frame, detections_summary = YOLO_DETECTOR.detect_from_frame(frame)
-                
-                # Accumuler les détections dans le buffer
-                if detections_summary:
-                    for waste_type, count in detections_summary.items():
-                        if waste_type not in detection_buffer:
-                            detection_buffer[waste_type] = 0
-                        detection_buffer[waste_type] += count
-            
-            # Sauvegarder toutes les SAVE_INTERVAL frames
-            frame_count += 1
-            if frame_count >= SAVE_INTERVAL and detection_buffer:
-                # Sauvegarder dans la BD
-                if user_id and YOLO_DETECTOR and YOLO_DETECTOR.is_ready():
-                    try:
-                        YOLO_DETECTOR.save_detections_to_db(user_id, detection_buffer)
-                        print(f"Detections sauvegardees: {detection_buffer}")
-                    except Exception as e:
-                        print(f"Erreur sauvegarde detections: {e}")
-                
-                # Réinitialiser le buffer et le compteur
-                detection_buffer = {}
-                frame_count = 0
-            
-            ret, buffer = cv2.imencode('.jpg', frame)
-            frame = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+    try:
+        while True:
+            _collect_async_detections()
+
+            # ---------- NEW: Trigger arm for newly confirmed detections ----------
+            for waste_type, count in stream_new_counts.items():
+                for _ in range(count):
+                    robotic_arm.pick_up(waste_type)
+            stream_new_counts = {}   # clear after triggering
+
+            success, frame = cam.read()
+            if not success:
+                print("Echec lecture frame camera")
+                error_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(error_frame, "ERREUR CAMERA", (50, 240), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                ret, buffer = cv2.imencode('.jpg', error_frame)
+                frame = buffer.tobytes()
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+                break
+            else:
+                if YOLO_DETECTOR and YOLO_DETECTOR.is_ready():
+                    stream_frames_seen += 1
+                    if stream_detection_future is None and (
+                        stream_frames_seen == 1 or stream_frames_seen % STREAM_DETECT_EVERY_N_FRAMES == 0
+                    ):
+                        detection_frame = cam.prepare_for_detection(frame.copy())
+                        stream_detection_future = stream_executor.submit(
+                            YOLO_DETECTOR.detect_objects,
+                            detection_frame,
+                        )
+                    frame = YOLO_DETECTOR.draw_detections(frame, stream_latest_detections)
+
+                frame_count += 1
+                if frame_count >= SAVE_INTERVAL and detection_buffer:
+                    flush_detection_buffer(user_id=user_id)
+
+                ret, buffer = cv2.imencode('.jpg', frame, JPEG_ENCODE_PARAMS)
+                frame = buffer.tobytes()
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+    finally:
+        should_release_camera = False
+        with camera_stream_lock:
+            active_stream_clients = max(0, active_stream_clients - 1)
+            should_release_camera = active_stream_clients == 0
+        if should_release_camera:
+            flush_detection_buffer(user_id=user_id)
+            release_camera()
+            reset_stream_state()
+            robotic_arm.stop_motion(clear_queue=True)
+
 
 @app.route('/video_feed')
 @login_required
 def video_feed():
     user_id = session.get('user_id')
     return Response(gen_frames(user_id=user_id), mimetype='multipart/x-mixed-replace; boundary=frame')
+
 
 @app.route('/api/robot/status', methods=['GET'])
 @login_required
@@ -561,11 +795,10 @@ def get_robot_status():
         'is_active': False
     })
 
+
 @app.route('/api/camera/toggle', methods=['POST'])
 @login_required
 def toggle_camera_route():
-    global detection_buffer, frame_count
-    
     data = request.json
     action = data.get('action')
     
@@ -574,27 +807,104 @@ def toggle_camera_route():
             get_camera()
         except RuntimeError as exc:
             return jsonify({'success': False, 'message': str(exc)}), 500
-        # Réinitialiser le buffer et le compteur au démarrage
-        detection_buffer = {}
-        frame_count = 0
+        reset_stream_state()
     elif action == 'stop':
-        release_camera()
-        # Sauvegarder les détections restantes avant d'arrêter
         user_id = session.get('user_id')
-        if user_id and detection_buffer and YOLO_DETECTOR and YOLO_DETECTOR.is_ready():
-            try:
-                YOLO_DETECTOR.save_detections_to_db(user_id, detection_buffer)
-                print(f"Detections finales sauvegardees: {detection_buffer}")
-            except Exception as e:
-                print(f"Erreur sauvegarde detections finales: {e}")
-        detection_buffer = {}
-        frame_count = 0
+        if detection_buffer:
+            flush_detection_buffer(user_id=user_id)
+        release_camera()
+        reset_stream_state()
+        robotic_arm.stop_motion(clear_queue=True)
     
     return jsonify({
         'success': True,
         'message': f'Caméra {"activée" if action == "start" else "désactivée"}',
         'status': action
     })
+
+
+@app.route('/api/arm/status', methods=['GET'])
+@login_required
+def arm_status_route():
+    return jsonify({
+        'success': True,
+        'arm': robotic_arm.status(),
+    })
+
+
+@app.route('/api/arm/home', methods=['POST'])
+@login_required
+def arm_home_route():
+    ok = robotic_arm.home_now(clear_queue=True)
+    return jsonify({
+        'success': ok,
+        'message': 'Retour du bras a la position home demande' if ok else (robotic_arm.status().get('last_error') or 'Impossible de ramener le bras en home'),
+        'arm': robotic_arm.status(),
+    }), (200 if ok else 500)
+
+
+@app.route('/api/arm/move', methods=['POST'])
+@login_required
+def arm_move_route():
+    data = request.json or {}
+    joint = data.get('joint')
+    angle_raw = data.get('angle')
+
+    if joint in (None, '') or angle_raw in (None, ''):
+        return jsonify({
+            'success': False,
+            'message': 'joint et angle requis',
+        }), 400
+
+    try:
+        angle = int(angle_raw)
+    except (TypeError, ValueError):
+        return jsonify({
+            'success': False,
+            'message': 'angle doit etre un entier',
+        }), 400
+
+    ok = robotic_arm.move_joint(joint, angle, clear_queue=True)
+    return jsonify({
+        'success': ok,
+        'message': f'Mouvement demande pour {joint} a {angle} degres' if ok else (robotic_arm.status().get('last_error') or 'Impossible de bouger cette articulation'),
+        'arm': robotic_arm.status(),
+    }), (200 if ok else 500)
+
+
+@app.route('/api/arm/test', methods=['POST'])
+@login_required
+def arm_test_route():
+    data = request.json or {}
+    waste_type = normalize_waste_type_label(data.get('waste_type'))
+    if not waste_type:
+        return jsonify({'success': False, 'message': 'waste_type requis'}), 400
+
+    queued = robotic_arm.pick_up(waste_type)
+    if not queued:
+        return jsonify({
+            'success': False,
+            'message': robotic_arm.status().get('last_error') or 'Impossible de mettre la commande en file',
+            'arm': robotic_arm.status(),
+        }), 500
+
+    return jsonify({
+        'success': True,
+        'message': f'Commande envoyee au bras pour {waste_type}',
+        'arm': robotic_arm.status(),
+    })
+
+
+@app.route('/api/arm/stop', methods=['POST'])
+@login_required
+def arm_stop_route():
+    ok = robotic_arm.stop_motion(clear_queue=True)
+    return jsonify({
+        'success': ok,
+        'message': 'Arret du bras demande',
+        'arm': robotic_arm.status(),
+    }), (200 if ok else 500)
+
 
 @app.route('/api/camera/recent-detections', methods=['GET'])
 @login_required
@@ -630,6 +940,7 @@ def get_recent_detections():
             'detections': {}
         })
 
+
 @app.route('/api/robot/stats', methods=['GET'])
 @login_required
 def get_robot_stats():
@@ -656,6 +967,7 @@ def get_robot_stats():
         'today': {'detections': detections_today, 'quantity': quantity_today},
         'total': {'detections': total_detections, 'quantity': total_quantity}
     })
+
 
 @app.route('/api/robot/add', methods=['POST'])
 @login_required
@@ -685,6 +997,7 @@ def add_robot():
     
     return jsonify({'success': True, 'message': 'Robot mis à jour'})
 
+
 # ==================== ROUTES DÉTECTION ROBOT ====================
 
 @app.route('/api/detection/record', methods=['POST'])
@@ -698,7 +1011,7 @@ def record_detection():
     # L'utilisateur peut être identifié par un token ou un ID robot
     user_id = data.get('user_id')
     robot_id = data.get('robot_id')
-    waste_type = data.get('waste_type')
+    waste_type = normalize_waste_type_label(data.get('waste_type'))
     quantity = data.get('quantity', 1)
     detection_date = data.get('detection_date', datetime.now())
     
@@ -721,6 +1034,7 @@ def record_detection():
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
+
 @app.route('/api/detection/batch', methods=['POST'])
 def record_batch_detection():
     """
@@ -740,7 +1054,7 @@ def record_batch_detection():
         c = conn.cursor()
         
         for detection in detections:
-            waste_type = detection.get('waste_type')
+            waste_type = normalize_waste_type_label(detection.get('waste_type'))
             quantity = detection.get('quantity', 1)
             detection_date = detection.get('detection_date', datetime.now())
             
@@ -759,6 +1073,7 @@ def record_batch_detection():
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
+
 # ==================== ROUTES YOLO ====================
 
 @app.route('/yolo-detect')
@@ -769,6 +1084,7 @@ def yolo_detect():
     if yolo_template.exists():
         return render_template('yolo_detect.html', email=session.get('email'))
     return redirect('/camera')
+
 
 @app.route('/api/yolo/detect-image', methods=['POST'])
 @login_required
@@ -840,6 +1156,7 @@ def yolo_detect_image():
             except OSError:
                 pass
 
+
 @app.route("/predict", methods=['POST'])
 def predict():
     if not load_yolo():
@@ -860,6 +1177,7 @@ def predict():
         return jsonify({'success': False, 'message': "Echec d'encodage image"}), 500
 
     return send_file(io.BytesIO(img_encoded.tobytes()), mimetype="image/jpeg")
+
 
 @app.route('/api/yolo/detect-webcam', methods=['POST'])
 @login_required
@@ -892,6 +1210,7 @@ def yolo_detect_webcam():
     except Exception as e:
         return jsonify({'success': False, 'message': f'Erreur: {str(e)}'}), 500
 
+
 @app.route('/api/yolo/save-detections', methods=['POST'])
 @login_required
 def yolo_save_detections():
@@ -908,6 +1227,9 @@ def yolo_save_detections():
         c = conn.cursor()
         
         for waste_type, quantity in detections.items():
+            waste_type = normalize_waste_type_label(waste_type)
+            if not waste_type:
+                continue
             c.execute('''INSERT INTO waste_detection (user_id, waste_type, quantity, detection_date)
                          VALUES (?, ?, ?, ?)''',
                      (user_id, waste_type, quantity, datetime.now()))
@@ -925,15 +1247,17 @@ def yolo_save_detections():
     except Exception as e:
         return jsonify({'success': False, 'message': f'Erreur: {str(e)}'}), 500
 
+
 # ==================== ROUTES STATS & CHARTS ====================
 
 @app.route('/api/stats/monthly-distribution', methods=['GET'])
 @login_required
 def get_monthly_distribution():
     """Statistiques d'un mois spécifique pour le diagramme circulaire"""
-    user_id = session.get('user_id')
-    month = request.args.get('month', datetime.now().strftime('%m'))
-    year = request.args.get('year', datetime.now().strftime('%Y'))
+    year, month = parse_year_month(
+        request.args.get('year', datetime.now().strftime('%Y')),
+        request.args.get('month', datetime.now().strftime('%m')),
+    )
     
     target_month = f"{year}-{month}"
     
@@ -943,29 +1267,30 @@ def get_monthly_distribution():
         
         c.execute('''SELECT waste_type, SUM(quantity) 
                      FROM waste_detection 
-                     WHERE user_id = ? 
-                     AND strftime('%Y-%m', detection_date) = ?
-                     GROUP BY waste_type''', (user_id, target_month))
+                     WHERE strftime('%Y-%m', detection_date) = ?
+                     GROUP BY waste_type''', (target_month,))
         
         results = c.fetchall()
         conn.close()
         
-        waste_types = {row[0]: row[1] for row in results}
+        waste_types = aggregate_waste_rows(results)
         total = sum(waste_types.values())
         
         return jsonify({
             'total': total,
-            'waste_types': waste_types
+            'waste_types': waste_types,
+            'year': int(year),
+            'month': month,
+            'scope': 'global'
         })
     except Exception as e:
         return jsonify({'total': 0, 'waste_types': {}}), 500
+
 
 @app.route('/api/stats/last-month', methods=['GET'])
 @login_required
 def get_last_month_stats():
     """Statistiques du mois dernier"""
-    user_id = session.get('user_id')
-    
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -973,14 +1298,13 @@ def get_last_month_stats():
         # Get last month data
         c.execute('''SELECT waste_type, SUM(quantity) 
                      FROM waste_detection 
-                     WHERE user_id = ? 
-                     AND strftime('%Y-%m', detection_date) = strftime('%Y-%m', 'now', '-1 month')
-                     GROUP BY waste_type''', (user_id,))
+                     WHERE strftime('%Y-%m', detection_date) = strftime('%Y-%m', 'now', '-1 month')
+                     GROUP BY waste_type''')
         
         results = c.fetchall()
         conn.close()
         
-        waste_types = {row[0]: row[1] for row in results}
+        waste_types = aggregate_waste_rows(results)
         total = sum(waste_types.values())
         
         return jsonify({
@@ -990,12 +1314,11 @@ def get_last_month_stats():
     except Exception as e:
         return jsonify({'total': 0, 'waste_types': {}}), 500
 
+
 @app.route('/api/stats/total', methods=['GET'])
 @login_required
 def get_total_stats():
     """Statistiques totales"""
-    user_id = session.get('user_id')
-    
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -1003,13 +1326,12 @@ def get_total_stats():
         # Get all time data
         c.execute('''SELECT waste_type, SUM(quantity) 
                      FROM waste_detection 
-                     WHERE user_id = ? 
-                     GROUP BY waste_type''', (user_id,))
+                     GROUP BY waste_type''')
         
         results = c.fetchall()
         conn.close()
         
-        waste_types = {row[0]: row[1] for row in results}
+        waste_types = aggregate_waste_rows(results)
         total = sum(waste_types.values())
         
         return jsonify({
@@ -1019,13 +1341,13 @@ def get_total_stats():
     except Exception as e:
         return jsonify({'total': 0, 'waste_types': {}}), 500
 
+
 @app.route('/api/chart/monthly', methods=['GET'])
 @login_required
 def get_monthly_chart():
     """Données pour le graphique mensuel"""
-    user_id = session.get('user_id')
     year = request.args.get('year', datetime.now().year, type=int)
-    waste_type = request.args.get('waste_type', 'all')
+    waste_type = normalize_waste_type_label(request.args.get('waste_type', 'all'))
     
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -1035,24 +1357,17 @@ def get_monthly_chart():
         data = []
         
         for month_num in range(1, 13):
+            c.execute('''SELECT waste_type, SUM(quantity) 
+                         FROM waste_detection 
+                         WHERE strftime('%Y', detection_date) = ? 
+                         AND strftime('%m', detection_date) = ?
+                         GROUP BY waste_type''',
+                     (str(year), f'{month_num:02d}'))
+            summary = aggregate_waste_rows(c.fetchall())
             if waste_type == 'all':
-                c.execute('''SELECT SUM(quantity) 
-                             FROM waste_detection 
-                             WHERE user_id = ? 
-                             AND strftime('%Y', detection_date) = ? 
-                             AND strftime('%m', detection_date) = ?''',
-                         (user_id, str(year), f'{month_num:02d}'))
+                data.append(sum(summary.values()))
             else:
-                c.execute('''SELECT SUM(quantity) 
-                             FROM waste_detection 
-                             WHERE user_id = ? 
-                             AND waste_type = ?
-                             AND strftime('%Y', detection_date) = ? 
-                             AND strftime('%m', detection_date) = ?''',
-                         (user_id, waste_type, str(year), f'{month_num:02d}'))
-            
-            result = c.fetchone()
-            data.append(result[0] if result[0] else 0)
+                data.append(summary.get(waste_type, 0))
         
         conn.close()
         
@@ -1064,13 +1379,13 @@ def get_monthly_chart():
         print(f"Error in monthly chart: {e}")
         return jsonify({'months': [], 'data': []}), 500
 
+
 @app.route('/api/chart/weekly', methods=['GET'])
 @login_required
 def get_weekly_chart():
     """Données pour le graphique hebdomadaire"""
-    user_id = session.get('user_id')
     week_offset = request.args.get('week_offset', 0, type=int)
-    waste_type = request.args.get('waste_type', 'all')
+    waste_type = normalize_waste_type_label(request.args.get('waste_type', 'all'))
     
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -1088,22 +1403,16 @@ def get_weekly_chart():
             target_date = start_of_week + timedelta(days=day_num)
             date_str = target_date.strftime('%Y-%m-%d')
             
+            c.execute('''SELECT waste_type, SUM(quantity) 
+                         FROM waste_detection 
+                         WHERE DATE(detection_date) = ?
+                         GROUP BY waste_type''',
+                     (date_str,))
+            summary = aggregate_waste_rows(c.fetchall())
             if waste_type == 'all':
-                c.execute('''SELECT SUM(quantity) 
-                             FROM waste_detection 
-                             WHERE user_id = ? 
-                             AND DATE(detection_date) = ?''',
-                         (user_id, date_str))
+                data.append(sum(summary.values()))
             else:
-                c.execute('''SELECT SUM(quantity) 
-                             FROM waste_detection 
-                             WHERE user_id = ? 
-                             AND waste_type = ?
-                             AND DATE(detection_date) = ?''',
-                         (user_id, waste_type, date_str))
-            
-            result = c.fetchone()
-            data.append(result[0] if result[0] else 0)
+                data.append(summary.get(waste_type, 0))
         
         conn.close()
         
@@ -1115,6 +1424,7 @@ def get_weekly_chart():
         print(f"Error in weekly chart: {e}")
         return jsonify({'days': [], 'data': []}), 500
 
+
 # ==================== ROUTES ADMIN ====================
 
 @app.route('/admin/users')
@@ -1123,6 +1433,7 @@ def get_weekly_chart():
 def admin_users_page():
     """Page de gestion des utilisateurs (admin uniquement)"""
     return render_template('admin_users.html', email=session.get('email'))
+
 
 @app.route('/api/admin/users', methods=['GET'])
 @login_required
@@ -1151,6 +1462,7 @@ def get_all_users():
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
+
 @app.route('/api/admin/users/<int:user_id>/role', methods=['PUT'])
 @login_required
 @admin_required
@@ -1176,6 +1488,7 @@ def update_user_role(user_id):
         return jsonify({'success': True, 'message': f'Rôle mis à jour en {new_role}'})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
+
 
 @app.route('/api/admin/users/<int:user_id>', methods=['DELETE'])
 @login_required
@@ -1205,6 +1518,7 @@ def delete_user(user_id):
         return jsonify({'success': True, 'message': 'Utilisateur supprimé'})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
+
 
 # ==================== ROUTES NOTIFICATIONS ====================
 
@@ -1248,6 +1562,7 @@ def get_notifications():
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
+
 @app.route('/api/notifications/<int:notification_id>/mark-read', methods=['POST'])
 @login_required
 def mark_notification_read(notification_id):
@@ -1268,6 +1583,7 @@ def mark_notification_read(notification_id):
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
+
 @app.route('/api/notifications/mark-all-read', methods=['POST'])
 @login_required
 def mark_all_notifications_read():
@@ -1286,6 +1602,7 @@ def mark_all_notifications_read():
         return jsonify({'success': True, 'message': 'Toutes les notifications marquées comme lues'})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
+
 
 @app.route('/api/notifications/<int:notification_id>', methods=['DELETE'])
 @login_required
@@ -1307,6 +1624,7 @@ def delete_notification(notification_id):
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
+
 # ==================== ROUTES DETECTION PAGE ====================
 
 @app.route('/detections')
@@ -1315,12 +1633,11 @@ def detections_page():
     """Page de détection avec liste et exports"""
     return render_template('detections.html', email=session.get('email'))
 
+
 @app.route('/api/detections/list', methods=['GET'])
 @login_required
 def get_detections_list():
     """Récupérer la liste des détections avec filtres et pagination"""
-    user_id = session.get('user_id')
-    
     # Get filters from query params
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
@@ -1331,33 +1648,22 @@ def get_detections_list():
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        
-        query = '''SELECT id, waste_type, quantity, detection_date 
-                   FROM waste_detection 
-                   WHERE user_id = ?'''
-        params = [user_id]
-        
-        if start_date:
-            query += ' AND DATE(detection_date) >= ?'
-            params.append(start_date)
-        
-        if end_date:
-            query += ' AND DATE(detection_date) <= ?'
-            params.append(end_date)
-        
-        if waste_type and waste_type != 'all':
-            query += ' AND waste_type = ?'
-            params.append(waste_type)
-        
-        # Get total count before pagination
-        count_query = query.replace('SELECT id, waste_type, quantity, detection_date', 'SELECT COUNT(*)')
-        c.execute(count_query, params)
+        where_sql, filter_params = build_global_detection_filters(start_date, end_date, waste_type)
+
+        count_query = f'''SELECT COUNT(*)
+                          FROM waste_detection wd
+                          {where_sql}'''
+        c.execute(count_query, filter_params)
         total = c.fetchone()[0]
-        
-        # Add pagination
-        query += ' ORDER BY detection_date DESC LIMIT ? OFFSET ?'
-        params.extend([per_page, (page - 1) * per_page])
-        
+
+        query = f'''SELECT wd.id, wd.waste_type, wd.quantity, wd.detection_date,
+                           COALESCE(NULLIF(u.username, ''), u.email) AS owner_label
+                    FROM waste_detection wd
+                    LEFT JOIN users u ON u.id = wd.user_id
+                    {where_sql}
+                    ORDER BY wd.detection_date DESC
+                    LIMIT ? OFFSET ?'''
+        params = list(filter_params) + [per_page, (page - 1) * per_page]
         c.execute(query, params)
         detections = c.fetchall()
         
@@ -1365,7 +1671,17 @@ def get_detections_list():
         
         return jsonify({
             'success': True,
-            'detections': [{'id': d[0], 'waste_type': d[1], 'quantity': d[2], 'date': d[3]} for d in detections],
+            'scope': 'global',
+            'detections': [
+                {
+                    'id': d[0],
+                    'waste_type': d[1],
+                    'quantity': d[2],
+                    'date': d[3],
+                    'owner': d[4] or 'Utilisateur inconnu',
+                }
+                for d in detections
+            ],
             'total': total,
             'page': page,
             'per_page': per_page,
@@ -1374,14 +1690,13 @@ def get_detections_list():
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
+
 @app.route('/api/detections/export/csv', methods=['GET'])
 @login_required
 def export_detections_csv():
     """Exporter les détections en CSV"""
     import csv
     from io import StringIO
-    
-    user_id = session.get('user_id')
     
     # Get filters
     start_date = request.args.get('start_date')
@@ -1391,33 +1706,21 @@ def export_detections_csv():
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        
-        query = '''SELECT id, waste_type, quantity, detection_date 
-                   FROM waste_detection 
-                   WHERE user_id = ?'''
-        params = [user_id]
-        
-        if start_date:
-            query += ' AND DATE(detection_date) >= ?'
-            params.append(start_date)
-        
-        if end_date:
-            query += ' AND DATE(detection_date) <= ?'
-            params.append(end_date)
-        
-        if waste_type and waste_type != 'all':
-            query += ' AND waste_type = ?'
-            params.append(waste_type)
-        
-        query += ' ORDER BY detection_date DESC'
-        
+        where_sql, params = build_global_detection_filters(start_date, end_date, waste_type)
+        query = f'''SELECT wd.id, COALESCE(NULLIF(u.username, ''), u.email) AS owner_label,
+                           wd.waste_type, wd.quantity, wd.detection_date
+                    FROM waste_detection wd
+                    LEFT JOIN users u ON u.id = wd.user_id
+                    {where_sql}
+                    ORDER BY wd.detection_date DESC'''
+
         c.execute(query, params)
         detections = c.fetchall()
         conn.close()
         
         si = StringIO()
         writer = csv.writer(si)
-        writer.writerow(['ID', 'Type de déchet', 'Quantité', 'Date de détection'])
+        writer.writerow(['ID', 'Profil source', 'Type de déchet', 'Quantité', 'Date de détection'])
         writer.writerows(detections)
         
         output = si.getvalue()
@@ -1430,6 +1733,7 @@ def export_detections_csv():
         )
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
+
 
 @app.route('/api/detections/export/pdf', methods=['GET'])
 @login_required
@@ -1444,8 +1748,6 @@ def export_detections_pdf():
     except ImportError:
         return jsonify({'success': False, 'message': 'reportlab non installé. Exécutez: pip install reportlab'}), 500
     
-    user_id = session.get('user_id')
-    
     # Get filters
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
@@ -1454,26 +1756,14 @@ def export_detections_pdf():
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        
-        query = '''SELECT id, waste_type, quantity, detection_date 
-                   FROM waste_detection 
-                   WHERE user_id = ?'''
-        params = [user_id]
-        
-        if start_date:
-            query += ' AND DATE(detection_date) >= ?'
-            params.append(start_date)
-        
-        if end_date:
-            query += ' AND DATE(detection_date) <= ?'
-            params.append(end_date)
-        
-        if waste_type and waste_type != 'all':
-            query += ' AND waste_type = ?'
-            params.append(waste_type)
-        
-        query += ' ORDER BY detection_date DESC'
-        
+        where_sql, params = build_global_detection_filters(start_date, end_date, waste_type)
+        query = f'''SELECT wd.id, COALESCE(NULLIF(u.username, ''), u.email) AS owner_label,
+                           wd.waste_type, wd.quantity, wd.detection_date
+                    FROM waste_detection wd
+                    LEFT JOIN users u ON u.id = wd.user_id
+                    {where_sql}
+                    ORDER BY wd.detection_date DESC'''
+
         c.execute(query, params)
         detections = c.fetchall()
         conn.close()
@@ -1487,14 +1777,20 @@ def export_detections_pdf():
         title_style = styles['Heading1']
         
         # Title
-        title = Paragraph("Rapport de Détections - WasteAI", title_style)
+        title = Paragraph("Rapport Global de Détections - WasteAI", title_style)
         elements.append(title)
         elements.append(Spacer(1, 20))
         
         # Table data
-        data = [['ID', 'Type de déchet', 'Quantité', 'Date de détection']]
+        data = [['ID', 'Profil source', 'Type de déchet', 'Quantité', 'Date de détection']]
         for detection in detections:
-            data.append([str(detection[0]), detection[1], str(detection[2]), detection[3]])
+            data.append([
+                str(detection[0]),
+                detection[1] or 'Utilisateur inconnu',
+                detection[2],
+                str(detection[3]),
+                detection[4],
+            ])
         
         # Create table
         table = Table(data)
@@ -1523,6 +1819,7 @@ def export_detections_pdf():
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
+
 # ==================== ROUTE DE TEST ====================
 
 @app.route('/test-api')
@@ -1530,6 +1827,7 @@ def export_detections_pdf():
 def test_api():
     """Page de test des API"""
     return render_template('test_api.html')
+
 
 if __name__ == '__main__':
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
